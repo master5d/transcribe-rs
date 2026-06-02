@@ -205,13 +205,37 @@ impl WhisperEngine {
         samples: &[f32],
         params: &WhisperInferenceParams,
     ) -> Result<TranscriptionResult, TranscribeError> {
-        self.infer(samples, params)
+        self.infer(samples, params, None, None)
+    }
+
+    /// Like [`transcribe_with`], but reports progress (0–100) via `on_progress` and
+    /// aborts early when `should_abort` returns true (checked by whisper.cpp during
+    /// inference). Both run on the inference thread.
+    pub fn transcribe_with_callbacks<P, A>(
+        &mut self,
+        samples: &[f32],
+        params: &WhisperInferenceParams,
+        on_progress: P,
+        should_abort: A,
+    ) -> Result<TranscriptionResult, TranscribeError>
+    where
+        P: FnMut(i32) + 'static,
+        A: FnMut() -> bool + 'static,
+    {
+        self.infer(
+            samples,
+            params,
+            Some(Box::new(on_progress)),
+            Some(Box::new(should_abort)),
+        )
     }
 
     fn infer(
         &mut self,
         samples: &[f32],
         params: &WhisperInferenceParams,
+        on_progress: Option<Box<dyn FnMut(i32) + 'static>>,
+        should_abort: Option<Box<dyn FnMut() -> bool + 'static>>,
     ) -> Result<TranscriptionResult, TranscribeError> {
         let mut full_params = FullParams::new(SamplingStrategy::BeamSearch {
             beam_size: 3,
@@ -240,6 +264,13 @@ impl WhisperEngine {
         );
         if want_tokens {
             full_params.set_token_timestamps(true);
+        }
+
+        if let Some(cb) = on_progress {
+            full_params.set_progress_callback_safe(cb);
+        }
+        if let Some(cb) = should_abort {
+            full_params.set_abort_callback_safe(cb);
         }
 
         self.state
@@ -372,6 +403,6 @@ impl SpeechModel for WhisperEngine {
             translate: options.translate,
             ..Default::default()
         };
-        self.infer(samples, &params)
+        self.infer(samples, &params, None, None)
     }
 }
