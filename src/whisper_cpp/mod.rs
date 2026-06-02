@@ -29,6 +29,7 @@
 pub mod gpu;
 
 use crate::accel::{get_whisper_accelerator, get_whisper_gpu_device, GPU_DEVICE_AUTO};
+use crate::word_grouping::{group_tokens_into_words, RawTok};
 use crate::{
     ModelCapabilities, SpeechModel, TimestampGranularity, TranscribeError, TranscribeOptions,
     TranscriptionResult, TranscriptionSegment,
@@ -233,11 +234,87 @@ impl WhisperEngine {
             full_params.set_initial_prompt(prompt);
         }
 
+        let want_tokens = matches!(
+            params.timestamp_granularity,
+            Some(TimestampGranularity::Word) | Some(TimestampGranularity::Token)
+        );
+        if want_tokens {
+            full_params.set_token_timestamps(true);
+        }
+
         self.state
             .full(full_params, samples)
             .map_err(|e| TranscribeError::Inference(e.to_string()))?;
 
         let num_segments = self.state.full_n_segments();
+
+        if want_tokens {
+            let mut segments = Vec::new();
+            let mut full_text = String::new();
+            for s in 0..num_segments {
+                let segment = self.state.get_segment(s).ok_or_else(|| {
+                    TranscribeError::Inference(format!("segment {s} out of bounds"))
+                })?;
+                let n_tok = segment.n_tokens();
+                let mut raw: Vec<RawTok> = Vec::new();
+                for t in 0..n_tok {
+                    let token = match segment.get_token(t) {
+                        Some(tk) => tk,
+                        None => continue,
+                    };
+                    // Skip whisper special tokens ([_BEG_], [_TT_..], etc.).
+                    if token
+                        .to_str_lossy()
+                        .map(|s| s.starts_with("[_"))
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let bytes = match token.to_bytes() {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => continue,
+                    };
+                    let data = token.token_data();
+                    raw.push(RawTok {
+                        start: data.t0 as f32 / 100.0, // centiseconds -> seconds
+                        end: data.t1 as f32 / 100.0,
+                        bytes,
+                    });
+                }
+                match params.timestamp_granularity {
+                    Some(TimestampGranularity::Token) => {
+                        for r in raw {
+                            let text = String::from_utf8_lossy(&r.bytes).trim().to_string();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            full_text.push(' ');
+                            full_text.push_str(&text);
+                            segments.push(TranscriptionSegment {
+                                start: r.start,
+                                end: r.end,
+                                text,
+                            });
+                        }
+                    }
+                    _ => {
+                        for w in group_tokens_into_words(&raw) {
+                            full_text.push(' ');
+                            full_text.push_str(&w.text);
+                            segments.push(TranscriptionSegment {
+                                start: w.start,
+                                end: w.end,
+                                text: w.text,
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(TranscriptionResult {
+                text: full_text.trim().to_string(),
+                segments: Some(segments),
+            });
+        }
 
         let mut segments = Vec::new();
         let mut full_text = String::new();
