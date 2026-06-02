@@ -30,8 +30,8 @@ pub mod gpu;
 
 use crate::accel::{get_whisper_accelerator, get_whisper_gpu_device, GPU_DEVICE_AUTO};
 use crate::{
-    ModelCapabilities, SpeechModel, TranscribeError, TranscribeOptions, TranscriptionResult,
-    TranscriptionSegment,
+    ModelCapabilities, SpeechModel, TimestampGranularity, TranscribeError, TranscribeOptions,
+    TranscriptionResult, TranscriptionSegment,
 };
 use gpu::auto_select_gpu_device;
 use log::info;
@@ -110,6 +110,10 @@ pub struct WhisperInferenceParams {
 
     /// Initial prompt to provide context to the model.
     pub initial_prompt: Option<String>,
+
+    /// Timestamp detail to emit. `None`/`Segment` keep the existing segment-only
+    /// behavior; `Word`/`Token` enable whisper.cpp token timestamps.
+    pub timestamp_granularity: Option<TimestampGranularity>,
 }
 
 impl Default for WhisperInferenceParams {
@@ -126,6 +130,7 @@ impl Default for WhisperInferenceParams {
             no_speech_thold: 0.2,
             n_threads: 0,
             initial_prompt: None,
+            timestamp_granularity: None,
         }
     }
 }

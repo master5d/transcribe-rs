@@ -14,14 +14,7 @@ use crate::{
     TranscriptionSegment,
 };
 
-/// Timestamp granularity for Parakeet output.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub enum TimestampGranularity {
-    #[default]
-    Token,
-    Word,
-    Segment,
-}
+pub use crate::TimestampGranularity;
 
 /// Per-model inference parameters for Parakeet.
 #[derive(Debug, Clone, Default)]

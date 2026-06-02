@@ -137,6 +137,16 @@ pub struct ModelCapabilities {
     pub supports_streaming: bool,
 }
 
+/// Timestamp granularity for output segments.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimestampGranularity {
+    #[default]
+    Token,
+    Word,
+    Segment,
+}
+
 /// Options for transcription.
 #[derive(Debug, Clone, Default)]
 pub struct TranscribeOptions {
