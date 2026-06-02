@@ -105,6 +105,7 @@ pub mod onnx;
 
 pub mod transcriber;
 pub mod vad;
+pub mod word_grouping;
 
 #[cfg(feature = "whisper-cpp")]
 pub mod whisper_cpp;
