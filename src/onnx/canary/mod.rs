@@ -4,6 +4,7 @@ mod vocab;
 use std::path::Path;
 use std::time::Instant;
 
+use ndarray::Ix3;
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -92,6 +93,13 @@ pub struct CanaryModel {
     decoder: Session,
     vocab: Vocab,
     variant: CanaryVariant,
+    encoder_format: CanaryEncoderFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanaryEncoderFormat {
+    FluidInference,
+    Sherpa,
 }
 
 impl CanaryModel {
@@ -122,17 +130,18 @@ impl CanaryModel {
 
         // Encoder and decoder respect quantization
         let encoder_path =
-            super::session::resolve_model_path(model_dir, "encoder-model", quantization);
+            resolve_canary_model_path(model_dir, &["encoder-model", "encoder"], quantization);
         log::info!("Loading Canary encoder from {:?}...", encoder_path);
         let encoder = super::session::create_session(&encoder_path)?;
+        let encoder_format = detect_encoder_format(&encoder)?;
 
         let decoder_path =
-            super::session::resolve_model_path(model_dir, "decoder-model", quantization);
+            resolve_canary_model_path(model_dir, &["decoder-model", "decoder"], quantization);
         log::info!("Loading Canary decoder from {:?}...", decoder_path);
         let decoder = super::session::create_session(&decoder_path)?;
 
         // Vocabulary
-        let vocab_path = model_dir.join("vocab.txt");
+        let vocab_path = crate::decode::tokens::resolve_vocab_path(model_dir);
         let vocab = Vocab::load(&vocab_path)?;
 
         let variant = CanaryVariant::detect(vocab.size());
@@ -149,6 +158,7 @@ impl CanaryModel {
             decoder,
             vocab,
             variant,
+            encoder_format,
         })
     }
 
@@ -190,7 +200,6 @@ impl CanaryModel {
             preprocess_start.elapsed()
         );
 
-        // Pass outputs directly to encoder (no data copy)
         let features = preprocess_out
             .remove("features")
             .ok_or_else(|| TranscribeError::Inference("Missing features output".to_string()))?;
@@ -201,25 +210,46 @@ impl CanaryModel {
         // --- Step 2: Encode mel features -> encoder embeddings ---
         let encode_start = Instant::now();
 
-        let mut encoder_out = self.encoder.run(ort::inputs![
-            "audio_signal" => features,
-            "length" => features_lens
-        ])?;
+        let mut encoder_out = match self.encoder_format {
+            CanaryEncoderFormat::FluidInference => self.encoder.run(ort::inputs![
+                "audio_signal" => features,
+                "length" => features_lens
+            ])?,
+            CanaryEncoderFormat::Sherpa => {
+                let features = features
+                    .try_extract_array::<f32>()?
+                    .into_dimensionality::<Ix3>()
+                    .map_err(|e| TranscribeError::Inference(e.to_string()))?
+                    .permuted_axes([0, 2, 1])
+                    .to_owned()
+                    .into_dyn();
+                let features_lens = features_lens.try_extract_array::<i64>()?.to_owned();
+                let features = Tensor::from_array(features)?;
+                let features_lens = Tensor::from_array(features_lens)?;
+
+                self.encoder.run(ort::inputs![
+                    "x" => features,
+                    "x_len" => features_lens
+                ])?
+            }
+        };
 
         log::debug!(
             "Encoder output: embeddings shape {:?}, mask shape {:?} ({:.2?})",
-            encoder_out["encoder_embeddings"].shape(),
-            encoder_out["encoder_mask"].shape(),
+            encoder_out[encoder_embeddings_output_name(self.encoder_format)].shape(),
+            encoder_out[encoder_mask_output_name(self.encoder_format)].shape(),
             encode_start.elapsed()
         );
 
         // Pass outputs directly to decoder (no data copy)
-        let encoder_embeddings = encoder_out.remove("encoder_embeddings").ok_or_else(|| {
-            TranscribeError::Inference("Missing encoder_embeddings output".to_string())
-        })?;
+        let encoder_embeddings = encoder_out
+            .remove(encoder_embeddings_output_name(self.encoder_format))
+            .ok_or_else(|| {
+                TranscribeError::Inference("Missing encoder embeddings output".to_string())
+            })?;
         let encoder_mask = encoder_out
-            .remove("encoder_mask")
-            .ok_or_else(|| TranscribeError::Inference("Missing encoder_mask output".to_string()))?;
+            .remove(encoder_mask_output_name(self.encoder_format))
+            .ok_or_else(|| TranscribeError::Inference("Missing encoder mask output".to_string()))?;
 
         // --- Step 3: Build prompt tokens ---
         let prompt_tokens = self
@@ -255,6 +285,53 @@ impl CanaryModel {
             text,
             segments: None,
         })
+    }
+}
+
+fn resolve_canary_model_path(
+    dir: &Path,
+    names: &[&str],
+    quantization: &super::Quantization,
+) -> std::path::PathBuf {
+    for name in names {
+        let path = super::session::resolve_model_path(dir, name, quantization);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    super::session::resolve_model_path(dir, names[0], quantization)
+}
+
+fn detect_encoder_format(encoder: &Session) -> Result<CanaryEncoderFormat, TranscribeError> {
+    if encoder
+        .inputs()
+        .iter()
+        .any(|input| input.name() == "audio_signal")
+    {
+        return Ok(CanaryEncoderFormat::FluidInference);
+    }
+
+    if encoder.inputs().iter().any(|input| input.name() == "x") {
+        return Ok(CanaryEncoderFormat::Sherpa);
+    }
+
+    Err(TranscribeError::Inference(
+        "Unsupported Canary encoder inputs: expected audio_signal or x".to_string(),
+    ))
+}
+
+fn encoder_embeddings_output_name(format: CanaryEncoderFormat) -> &'static str {
+    match format {
+        CanaryEncoderFormat::FluidInference => "encoder_embeddings",
+        CanaryEncoderFormat::Sherpa => "enc_states",
+    }
+}
+
+fn encoder_mask_output_name(format: CanaryEncoderFormat) -> &'static str {
+    match format {
+        CanaryEncoderFormat::FluidInference => "encoder_mask",
+        CanaryEncoderFormat::Sherpa => "enc_mask",
     }
 }
 
