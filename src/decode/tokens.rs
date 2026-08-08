@@ -38,7 +38,8 @@ pub fn load_vocab(path: &Path) -> Result<(Vec<String>, Option<i32>), std::io::Er
     let mut blank_idx: Option<i32> = None;
 
     for line in content.lines() {
-        if let Some((token, id_str)) = line.trim_end_matches(['\r', '\n']).rsplit_once(' ') {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some((token, id_str)) = line.rsplit_once(' ').or_else(|| line.rsplit_once('\t')) {
             if let Ok(id) = id_str.parse::<usize>() {
                 let token = token.to_string();
                 if token == "<blk>" {
@@ -135,7 +136,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = write(&dir, "tokens.txt", "  0\nа 1\nб 2\n<blk> 3\n");
         let (vocab, blank) = load_vocab(&p).unwrap();
-        assert_eq!(vocab[0], " ", "пробел-токен обязан выжить, иначе текст склеится");
+        assert_eq!(
+            vocab[0], " ",
+            "пробел-токен обязан выжить, иначе текст склеится"
+        );
         assert_eq!(vocab[1], "а");
         assert_eq!(blank, Some(3));
     }
@@ -165,5 +169,21 @@ mod tests {
         // есть оба -> vocab.txt главнее
         write(&dir, "vocab.txt", "a 0\n");
         assert!(resolve_vocab_path(&dir).ends_with("vocab.txt"));
+    }
+
+    #[test]
+    fn tab_separated_tokens_file_supported() {
+        let dir = std::env::temp_dir().join("trs_vocab_tab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write(
+            &dir,
+            "tokens.txt",
+            "<unk>\t0\n<s>\t1\n</s>\t2\n\u{2581}hello\t3\n",
+        );
+        let (vocab, _) = load_vocab(&p).unwrap();
+        assert_eq!(vocab[0], "<unk>");
+        assert_eq!(vocab[1], "<s>");
+        assert_eq!(vocab[2], "</s>");
+        assert_eq!(vocab[3], " hello");
     }
 }
