@@ -20,20 +20,17 @@ impl Vocab {
         let mut id_to_token_map = HashMap::new();
 
         for (line_num, line) in content.lines().enumerate() {
-            let line = line.trim();
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 continue;
             }
 
-            let last_space = line.rfind(' ').ok_or_else(|| {
+            let (token, id_str) = line.rsplit_once(' ').ok_or_else(|| {
                 TranscribeError::Config(format!(
                     "Invalid vocab line {}: missing space separator",
                     line_num + 1
                 ))
             })?;
-
-            let token = &line[..last_space];
-            let id_str = &line[last_space + 1..];
 
             let id: i64 = id_str.parse().map_err(|e| {
                 TranscribeError::Config(format!("Invalid token ID on line {}: {e}", line_num + 1))
@@ -174,6 +171,24 @@ mod tests {
 
         let vocab = Vocab::load(&vocab_path).unwrap();
         let text = vocab.decode_tokens(&[1, 10, 20, 3]);
+
+        assert_eq!(text, "Hello world");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_decode_tokens_preserves_literal_space_token() {
+        let dir = create_temp_dir("space");
+        let vocab_path = dir.join("tokens.txt");
+        let mut f = fs::File::create(&vocab_path).unwrap();
+        writeln!(f, "<|endoftext|> 3").unwrap();
+        writeln!(f, "Hello 10").unwrap();
+        writeln!(f, "  11").unwrap();
+        writeln!(f, "world 12").unwrap();
+
+        let vocab = Vocab::load(&vocab_path).unwrap();
+        let text = vocab.decode_tokens(&[10, 11, 12, 3]);
 
         assert_eq!(text, "Hello world");
 

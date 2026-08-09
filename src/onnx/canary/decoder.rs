@@ -1,5 +1,8 @@
-use ndarray::Array4;
+use std::borrow::Cow;
+
+use ndarray::{Array2, Array3, Array4};
 use ort::session::Session;
+use ort::session::SessionInputValue;
 use ort::value::ValueType;
 use ort::value::{DynValue, Tensor};
 
@@ -8,6 +11,50 @@ use crate::decode::GreedyDecoder;
 use crate::TranscribeError;
 
 pub fn decode_autoregressive(
+    decoder: &mut Session,
+    encoder_embeddings: &DynValue,
+    encoder_mask: &DynValue,
+    prompt_tokens: Vec<i64>,
+    vocab: &Vocab,
+    max_sequence_length: usize,
+) -> Result<String, TranscribeError> {
+    if decoder
+        .inputs()
+        .iter()
+        .any(|input| input.name() == "decoder_mems")
+    {
+        return decode_fluidinference(
+            decoder,
+            encoder_embeddings,
+            encoder_mask,
+            prompt_tokens,
+            vocab,
+            max_sequence_length,
+        );
+    }
+
+    if decoder
+        .inputs()
+        .iter()
+        .any(|input| input.name() == "decoder_mems_list_0")
+    {
+        return decode_sherpa(
+            decoder,
+            encoder_embeddings,
+            encoder_mask,
+            prompt_tokens,
+            vocab,
+            max_sequence_length,
+        );
+    }
+
+    Err(TranscribeError::Inference(
+        "Unsupported Canary decoder inputs: expected decoder_mems or decoder_mems_list_0"
+            .to_string(),
+    ))
+}
+
+fn decode_fluidinference(
     decoder: &mut Session,
     encoder_embeddings: &DynValue,
     encoder_mask: &DynValue,
@@ -95,6 +142,137 @@ pub fn decode_autoregressive(
     Ok(text)
 }
 
+fn decode_sherpa(
+    decoder: &mut Session,
+    encoder_embeddings: &DynValue,
+    encoder_mask: &DynValue,
+    prompt_tokens: Vec<i64>,
+    vocab: &Vocab,
+    max_sequence_length: usize,
+) -> Result<String, TranscribeError> {
+    let (num_layers, hidden_dim) = extract_sherpa_decoder_mems_shape(decoder)?;
+
+    log::debug!(
+        "Sherpa decoder cache dimensions: num_layers={}, hidden_dim={}",
+        num_layers,
+        hidden_dim
+    );
+
+    let mut decoder_mems: Vec<DynValue> = (0..num_layers)
+        .map(|_| {
+            let empty_cache = Array3::<f32>::zeros((1, 0, hidden_dim));
+            Tensor::from_array(empty_cache).map(|v| v.into_dyn())
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut logits = Vec::new();
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        let (next_logits, next_mems) = run_sherpa_decoder_step(
+            decoder,
+            token,
+            pos as i32,
+            decoder_mems,
+            encoder_embeddings,
+            encoder_mask,
+            num_layers,
+        )?;
+        logits = next_logits;
+        decoder_mems = next_mems;
+    }
+
+    let eos_id = vocab.eos_token_id();
+    let mut greedy = GreedyDecoder::new(eos_id);
+    let mut generated = Vec::new();
+    let max_steps = max_sequence_length.saturating_sub(prompt_tokens.len());
+
+    for pos in 1..=max_steps {
+        let next_token = match greedy.next_token(&logits) {
+            Some(t) => t,
+            None => {
+                log::debug!("Decode stopped after {} generated tokens", generated.len());
+                break;
+            }
+        };
+
+        generated.push(next_token);
+
+        let (next_logits, next_mems) = run_sherpa_decoder_step(
+            decoder,
+            next_token,
+            pos as i32,
+            decoder_mems,
+            encoder_embeddings,
+            encoder_mask,
+            num_layers,
+        )?;
+        logits = next_logits;
+        decoder_mems = next_mems;
+    }
+
+    Ok(vocab.decode_tokens(&generated))
+}
+
+fn run_sherpa_decoder_step(
+    decoder: &mut Session,
+    token: i64,
+    position: i32,
+    decoder_mems: Vec<DynValue>,
+    encoder_embeddings: &DynValue,
+    encoder_mask: &DynValue,
+    num_layers: usize,
+) -> Result<(Vec<f32>, Vec<DynValue>), TranscribeError> {
+    let input_ids = Array2::from_shape_vec((1, 2), vec![token as i32, position])?.into_dyn();
+
+    let mut inputs: Vec<(Cow<str>, SessionInputValue)> = vec![
+        (
+            Cow::Borrowed("decoder_input_ids"),
+            SessionInputValue::from(ort::value::Value::from_array(input_ids)?),
+        ),
+        (
+            Cow::Borrowed("enc_states"),
+            SessionInputValue::from(encoder_embeddings),
+        ),
+        (
+            Cow::Borrowed("enc_mask"),
+            SessionInputValue::from(encoder_mask),
+        ),
+    ];
+
+    for (idx, mem) in decoder_mems.into_iter().enumerate() {
+        inputs.push((
+            Cow::Owned(format!("decoder_mems_list_{idx}")),
+            SessionInputValue::from(mem),
+        ));
+    }
+
+    let mut outputs = decoder.run(inputs)?;
+
+    let logits = {
+        let (logits_shape, logits_data) = outputs["logits"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| TranscribeError::Inference(format!("Failed to extract logits: {e}")))?;
+
+        let seq_len = logits_shape[1] as usize;
+        let vocab_size = logits_shape[2] as usize;
+        let last_step_offset = (seq_len - 1) * vocab_size;
+        logits_data[last_step_offset..last_step_offset + vocab_size].to_vec()
+    };
+
+    let next_mems = (0..num_layers)
+        .map(|idx| {
+            outputs
+                .remove(format!("next_decoder_mem_list_{idx}").as_str())
+                .ok_or_else(|| {
+                    TranscribeError::Inference(format!(
+                        "Missing next_decoder_mem_list_{idx} output"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok((logits, next_mems))
+}
+
 fn extract_decoder_mems_shape(decoder: &Session) -> Result<(usize, usize), TranscribeError> {
     let mems_input = decoder
         .inputs()
@@ -128,6 +306,58 @@ fn extract_decoder_mems_shape(decoder: &Session) -> Result<(usize, usize), Trans
         }
         other => Err(TranscribeError::Inference(format!(
             "decoder_mems input is not a tensor: {:?}",
+            other
+        ))),
+    }
+}
+
+fn extract_sherpa_decoder_mems_shape(decoder: &Session) -> Result<(usize, usize), TranscribeError> {
+    let mut num_layers = 0;
+    while decoder
+        .inputs()
+        .iter()
+        .any(|input| input.name() == format!("decoder_mems_list_{num_layers}"))
+    {
+        num_layers += 1;
+    }
+
+    if num_layers == 0 {
+        return Err(TranscribeError::Inference(
+            "Sherpa decoder model missing decoder_mems_list_* inputs".to_string(),
+        ));
+    }
+
+    let mems_input = decoder
+        .inputs()
+        .iter()
+        .find(|outlet| outlet.name() == "decoder_mems_list_0")
+        .ok_or_else(|| {
+            TranscribeError::Inference(
+                "Sherpa decoder model missing decoder_mems_list_0 input".to_string(),
+            )
+        })?;
+
+    match mems_input.dtype() {
+        ValueType::Tensor { shape, .. } => {
+            let dims: &[i64] = &shape;
+            if dims.len() != 3 {
+                return Err(TranscribeError::Inference(format!(
+                    "Expected 3D decoder_mems_list_0, got {}D",
+                    dims.len()
+                )));
+            }
+
+            let hidden_dim = dims[2];
+            if hidden_dim <= 0 {
+                return Err(TranscribeError::Inference(format!(
+                    "decoder_mems_list_0 has dynamic hidden_dim ({hidden_dim}); expected fixed"
+                )));
+            }
+
+            Ok((num_layers, hidden_dim as usize))
+        }
+        other => Err(TranscribeError::Inference(format!(
+            "decoder_mems_list_0 input is not a tensor: {:?}",
             other
         ))),
     }

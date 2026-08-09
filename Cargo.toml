@@ -80,6 +80,10 @@ whisper-rs = { version = "0.16.0", optional = true }
 
 # Examples with required features
 [[example]]
+name = "transcribe_cli"
+required-features = ["onnx"]
+
+[[example]]
 name = "parakeet"
 required-features = ["onnx"]
 

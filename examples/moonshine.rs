@@ -15,21 +15,45 @@ fn get_audio_duration(path: &PathBuf) -> Result<f64, Box<dyn std::error::Error>>
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let model_path = PathBuf::from("models/moonshine-base");
-    let wav_path = PathBuf::from("samples/dots.wav");
+    let args: Vec<String> = std::env::args().collect();
+    let int8 = args.iter().any(|a| a == "--int8");
+    let positional: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+
+    let model_path = PathBuf::from(
+        positional
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("models/moonshine-base"),
+    );
+    let wav_path = PathBuf::from(
+        positional
+            .get(1)
+            .map(|s| s.as_str())
+            .unwrap_or("samples/dots.wav"),
+    );
+
+    let quantization = if int8 {
+        Quantization::Int8
+    } else {
+        Quantization::FP32
+    };
 
     let audio_duration = get_audio_duration(&wav_path)?;
     println!("Audio duration: {:.2}s", audio_duration);
 
     println!("Using Moonshine engine");
-    println!("Loading model: {:?}", model_path);
+    println!(
+        "Loading model: {:?} (quantization: {})",
+        model_path,
+        if int8 { "int8" } else { "fp32" }
+    );
 
     let load_start = Instant::now();
-    let mut model = MoonshineModel::load(
-        &model_path,
-        MoonshineVariant::Base,
-        &Quantization::default(),
-    )?;
+    let mut model = MoonshineModel::load(&model_path, MoonshineVariant::Base, &quantization)?;
     let load_duration = load_start.elapsed();
     println!("Model loaded in {:.2?}", load_duration);
 

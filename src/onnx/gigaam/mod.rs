@@ -38,7 +38,8 @@ pub struct GigaAMModel {
 impl GigaAMModel {
     pub fn load(model_dir: &Path, quantization: &Quantization) -> Result<Self, TranscribeError> {
         let model_path = session::resolve_model_path(model_dir, "model", quantization);
-        let vocab_path = model_dir.join("vocab.txt");
+        // vocab.txt (FluidInference) либо tokens.txt (sherpa-onnx) — см. resolve_vocab_path.
+        let vocab_path = crate::decode::tokens::resolve_vocab_path(model_dir);
 
         if !model_path.exists() {
             return Err(TranscribeError::ModelNotFound(model_path));
