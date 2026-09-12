@@ -16,19 +16,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let quant = args.get(1).map(|s| s.as_str()).unwrap_or("int8");
-
-    let (model_path, quantization) = match quant {
-        "int4" => ("models/cohere-int4", Quantization::Int4),
-        "int8" => ("models/cohere-int8", Quantization::Int8),
-        other => {
-            eprintln!("Unknown quantization: {other}. Use 'int4' or 'int8'.");
+    let (model_path, wav_path, quant, quantization) = match args.as_slice() {
+        [_, quant] if quant == "int4" || quant == "int8" => {
+            let quantization = parse_quantization(quant)?;
+            (
+                PathBuf::from(format!("models/cohere-{quant}")),
+                PathBuf::from("samples/dots.wav"),
+                quant.as_str(),
+                quantization,
+            )
+        }
+        [_, model_path, wav_path, quant] => {
+            let quant = quant.trim_start_matches("--");
+            (
+                PathBuf::from(model_path),
+                PathBuf::from(wav_path),
+                quant,
+                parse_quantization(quant)?,
+            )
+        }
+        [_] => (
+            PathBuf::from("models/cohere-int8"),
+            PathBuf::from("samples/dots.wav"),
+            "int8",
+            Quantization::Int8,
+        ),
+        _ => {
+            eprintln!("Usage:");
+            eprintln!("  cohere [int4|int8]");
+            eprintln!("  cohere <model_dir> <wav_path> --int4|--int8");
             std::process::exit(1);
         }
     };
-
-    let model_path = PathBuf::from(model_path);
-    let wav_path = PathBuf::from("samples/dots.wav");
 
     let audio_duration = get_audio_duration(&wav_path)?;
     println!("Audio duration: {:.2}s", audio_duration);
@@ -55,4 +74,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Transcription result:\n{}", result.text);
 
     Ok(())
+}
+
+fn parse_quantization(quant: &str) -> Result<Quantization, Box<dyn std::error::Error>> {
+    match quant {
+        "int4" => Ok(Quantization::Int4),
+        "int8" => Ok(Quantization::Int8),
+        other => {
+            eprintln!("Unknown quantization: {other}. Use 'int4' or 'int8'.");
+            std::process::exit(1);
+        }
+    }
 }
